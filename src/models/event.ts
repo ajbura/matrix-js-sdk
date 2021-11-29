@@ -154,12 +154,26 @@ export interface IDecryptOptions {
     isRetry?: boolean;
 }
 
+export interface IMessageHiding {
+    reason?: string;
+}
+
 export class MatrixEvent extends EventEmitter {
     private pushActions: IActionsObject = null;
     private _replacingEvent: MatrixEvent = null;
     private _localRedactionEvent: MatrixEvent = null;
     private _isCancelled = false;
     private clearEvent?: IClearEvent;
+
+    /* Message hiding, as specified by MSC3515.
+     *
+     * If `null`/`undefined`, the message should be displayed as usual.
+     *
+     * Otherwise, the client should hide this message and this field may
+     * contain a reason to be displayed to users (e.g. "message pending
+     * moderation").
+     */
+    private messageHiding?: IMessageHiding;
 
     /* curve25519 key which we believe belongs to the sender of the event. See
      * getSenderKey()
@@ -935,6 +949,28 @@ export class MatrixEvent extends EventEmitter {
     }
 
     /**
+     * Apply a MSC3531 event to hide/unhide the message.
+     *
+     * @param visibilityEvent event causing the hide/unhide change.
+     * @return true if the event caused a change, false if it should be ignored.
+     */
+    public applyVisibilityChange(visible: boolean, reason?: string): boolean {
+        let change;
+        if (visible) {
+            change = this.messageHiding != null;
+            this.messageHiding = null;
+        } else {
+            change = this.messageHiding == null || this.messageHiding.reason != reason;
+            if (change) {
+                this.messageHiding = {
+                    reason,
+                };
+            }
+        }
+        return change;
+    }
+
+    /**
      * Update the content of an event in the same way it would be by the server
      * if it were redacted before it was sent to us
      *
@@ -1001,6 +1037,14 @@ export class MatrixEvent extends EventEmitter {
      */
     public isRedaction(): boolean {
         return this.getType() === "m.room.redaction";
+    }
+
+    public isVisibilityChange(): boolean {
+        const relation = this.getRelation();
+        if (!relation) {
+            return false;
+        }
+        return relation.rel_type == "m.visibility";
     }
 
     /**

@@ -104,6 +104,11 @@ interface IReceiptContent {
 
 type Receipts = Record<string, Record<string, IWrappedReceipt>>;
 
+type VisibilityChange = {
+    visible: boolean,
+    originServerTs: number
+};
+
 export enum NotificationCountType {
     Highlight = "highlight",
     Total = "total",
@@ -150,6 +155,14 @@ export class Room extends EventEmitter {
      * @experimental
      */
     public threads = new Map<string, Thread>();
+
+    /**
+     * A mapping of eventId to the latest visibility change to apply
+     * to the event.
+     *
+     * @experimental
+     */
+    private visibilityChanges = new Map<string, VisibilityChange>();
 
     /**
      * Construct a new Room.
@@ -1363,6 +1376,71 @@ export class Room extends EventEmitter {
             // NB: We continue to add the redaction event to the timeline so
             // clients can say "so and so redacted an event" if they wish to. Also
             // this may be needed to trigger an update.
+        }
+
+        if (event.isVisibilityChange()) {
+            // Apply MSC3531-style visibility changes.
+            (() => {
+                // Perform sanity checks on the event.
+                const relation = event.getRelation();
+                const originalEventId = relation.event_id;
+                let visible: boolean;
+                switch (relation["visibility"]) {
+                    case "hidden":
+                        visible = false;
+                        break;
+                    case "visible":
+                        visible = true;
+                        break;
+                    default:
+                        // Event is ill-formed.
+                        return; // From anonymous function;
+                }
+                const reason = event.getContent()["reason"];
+                if (reason != null && reason !== undefined && typeof reason != "string") {
+                    // Event is ill-formed.
+                    return;
+                }
+
+                // Ignore visibility change events that are not emitted by moderators.
+                const powerLevelsEvents = this.currentState.getStateEvents(EventType.RoomPowerLevels, "");
+                const powerLevels = powerLevelsEvents && powerLevelsEvents.getContent();
+                if (!powerLevels || powerLevels["org.matrix.msc3531.visibility"] < event.sender.powerLevel) {
+                    // Return from anonymous function.
+                    return;
+                }
+
+                // Record this change in visibility.
+                // If the event is not in our timeline and we only receive it later,
+                // we may need to apply the visibility change at a later date.
+
+                const visibilityChange = this.visibilityChanges.get(originalEventId);
+                if (visibilityChange) {
+                    if (event.getTs() < visibilityChange.originServerTs) {
+                        // This visibility change event has been superseeded by a new event,
+                        // ignore it.
+                        return; // From anonymous function;
+                    }
+                    visibilityChange.originServerTs = event.getTs();
+                    visibilityChange.visible = visible;
+                } else {
+                    this.visibilityChanges.set(originalEventId, {
+                        originServerTs: event.getTs(),
+                        visible,
+                    });
+                }
+
+                // Finally, let's check if the event is already in our timeline.
+                // If so, we need to patch it and inform listeners.
+
+                const originalEvent = this.findEventById(originalEventId);
+                if (!originalEvent) {
+                    return; // From anonymous function;
+                }
+                if (originalEvent.applyVisibilityChange(visible, reason)) {
+                    this.emit("Room.visibilityChange", event);
+                }
+            })();
         }
 
         if (event.getUnsigned().transaction_id) {
