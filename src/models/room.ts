@@ -104,9 +104,21 @@ interface IReceiptContent {
 
 type Receipts = Record<string, Record<string, IWrappedReceipt>>;
 
+/**
+ * A change to the visibility of a message.
+ */
 type VisibilityChange = {
+    // `true` if the message should be visible from now on, `false`
+    // if it should be hidden from now on.
     visible: boolean,
-    originServerTs: number
+
+    // The timestamp for this change. A more recent visibility change
+    // overwrites an older one.
+    originServerTs: number,
+
+    // Optionally, a reason for hiding the message, e.g. "moderation pending".
+    // Ignored if `this.visible == true`
+    reason?: string
 };
 
 export enum NotificationCountType {
@@ -1378,70 +1390,14 @@ export class Room extends EventEmitter {
             // this may be needed to trigger an update.
         }
 
+        // Implement MSC3531: hiding messages.
         if (event.isVisibilityChange()) {
-            // Apply MSC3531-style visibility changes.
-            (() => {
-                // Perform sanity checks on the event.
-                const relation = event.getRelation();
-                const originalEventId = relation.event_id;
-                let visible: boolean;
-                switch (relation["visibility"]) {
-                    case "hidden":
-                        visible = false;
-                        break;
-                    case "visible":
-                        visible = true;
-                        break;
-                    default:
-                        // Event is ill-formed.
-                        return; // From anonymous function;
-                }
-                const reason = event.getContent()["reason"];
-                if (reason != null && reason !== undefined && typeof reason != "string") {
-                    // Event is ill-formed.
-                    return;
-                }
-
-                // Ignore visibility change events that are not emitted by moderators.
-                const powerLevelsEvents = this.currentState.getStateEvents(EventType.RoomPowerLevels, "");
-                const powerLevels = powerLevelsEvents && powerLevelsEvents.getContent();
-                if (!powerLevels || powerLevels["org.matrix.msc3531.visibility"] < event.sender.powerLevel) {
-                    // Return from anonymous function.
-                    return;
-                }
-
-                // Record this change in visibility.
-                // If the event is not in our timeline and we only receive it later,
-                // we may need to apply the visibility change at a later date.
-
-                const visibilityChange = this.visibilityChanges.get(originalEventId);
-                if (visibilityChange) {
-                    if (event.getTs() < visibilityChange.originServerTs) {
-                        // This visibility change event has been superseeded by a new event,
-                        // ignore it.
-                        return; // From anonymous function;
-                    }
-                    visibilityChange.originServerTs = event.getTs();
-                    visibilityChange.visible = visible;
-                } else {
-                    this.visibilityChanges.set(originalEventId, {
-                        originServerTs: event.getTs(),
-                        visible,
-                    });
-                }
-
-                // Finally, let's check if the event is already in our timeline.
-                // If so, we need to patch it and inform listeners.
-
-                const originalEvent = this.findEventById(originalEventId);
-                if (!originalEvent) {
-                    return; // From anonymous function;
-                }
-                if (originalEvent.applyVisibilityChange(visible, reason)) {
-                    this.emit("Room.visibilityChange", event);
-                }
-            })();
+            // This event changes the visibility of another event, record
+            // the visibility change, inform clients if necessary.
+            this.applyNewVisibilityChangeEvent(event);
         }
+        // If any pending visibility change is waiting for this (older) event,
+        this.applyPendingVisibilityChanges(event);
 
         if (event.getUnsigned().transaction_id) {
             const existingEvent = this.txnToEvent[event.getUnsigned().transaction_id];
@@ -2326,6 +2282,111 @@ export class Room extends EventEmitter {
         } else {
             return "Empty room";
         }
+    }
+
+    /**
+     * When we receive a new visibility change event:
+     *
+     * - store this visibility change alongside the timeline, in case we
+     *   later need to apply it to an event that we haven't received yet;
+     * - if we have already received the event whose visibility has changed,
+     *   patch it to reflect the visibility change and inform listeners.
+     */
+    private applyNewVisibilityChangeEvent(event: MatrixEvent): void {
+        // Perform sanity checks on the event.
+        if (!event.isVisibilityChange()) {
+            // Internal error.
+            throw new Error("Expected a visibility change relation");
+        }
+
+        const relation = event.getRelation();
+        const originalEventId = relation.event_id;
+        let visible: boolean;
+        switch (relation["visibility"]) {
+            case "hidden":
+                visible = false;
+                break;
+            case "visible":
+                visible = true;
+                break;
+            default:
+                // Event is ill-formed.
+                return;
+        }
+        const reason = visible ? event.getContent()["reason"] : null;
+        if (reason != null && reason !== undefined && typeof reason != "string") {
+            // Event is ill-formed.
+            return;
+        }
+
+        // Ignore visibility change events that are not emitted by moderators.
+        const powerLevelsEvents = this.currentState.getStateEvents(EventType.RoomPowerLevels, "");
+        const powerLevels = powerLevelsEvents && powerLevelsEvents.getContent();
+        if (!powerLevels || powerLevels["org.matrix.msc3531.visibility"] < event.sender.powerLevel) {
+            return;
+        }
+
+        // Record this change in visibility.
+        // If the event is not in our timeline and we only receive it later,
+        // we may need to apply the visibility change at a later date.
+
+        const visibilityChange = this.visibilityChanges.get(originalEventId);
+        if (visibilityChange) {
+            if (event.getTs() < visibilityChange.originServerTs) {
+                // This visibility change event has been superseeded by a new event,
+                // ignore it.
+                return;
+            }
+            visibilityChange.originServerTs = event.getTs();
+            visibilityChange.visible = visible;
+        } else {
+            this.visibilityChanges.set(originalEventId, {
+                originServerTs: event.getTs(),
+                visible,
+                reason,
+            });
+        }
+
+        // Finally, let's check if the event is already in our timeline.
+        // If so, we need to patch it and inform listeners.
+
+        const originalEvent = this.findEventById(originalEventId);
+        if (!originalEvent) {
+            return;
+        }
+        if (originalEvent.applyVisibilityChange(visible, reason)) {
+            this.emit("Room.visibilityChange", event);
+        }
+    }
+
+    /**
+     * When we receive an event whose visibility has been altered by
+     * a (more recent) visibility change event, patch the event in
+     * place so that clients now not to display it.
+     *
+     * @param event Any matrix event. If this event has at least one a
+     * pending visibility change event, apply the latest visibility
+     * change event.
+     */
+    private applyPendingVisibilityChanges(event: MatrixEvent): void {
+        const visibilityChange = this.visibilityChanges.get(event.getId());
+        if (!visibilityChange) {
+            // No pending visibility change in store.
+            return;
+        }
+        if (visibilityChange.visible) {
+            // Events are visible by default, no need to apply a visibility change.
+            // Note that we need to keep the visibility changes in `visibilityChanges`,
+            // in case we later fetch an older visibility change event that is superseded
+            // by `visibilityChange`.
+            return;
+        }
+        if (visibilityChange.originServerTs < event.getTs()) {
+            // Something is wrong, the visibility change cannot happen before the
+            // event. Presumably an ill-formed event.
+            return;
+        }
+        event.applyVisibilityChange(false, visibilityChange.reason);
     }
 }
 

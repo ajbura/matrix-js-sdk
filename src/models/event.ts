@@ -1039,12 +1039,19 @@ export class MatrixEvent extends EventEmitter {
         return this.getType() === "m.room.redaction";
     }
 
+    /**
+     * Check if this event alters the visibility of another event.
+     *
+     * @returns {boolean} True if this event alters the visibility
+     * of another event.
+     */
     public isVisibilityChange(): boolean {
         const relation = this.getRelation();
         if (!relation) {
             return false;
         }
-        return relation.rel_type == "m.visibility";
+        return relation.rel_type == "m.visibility"
+            || relation.rel_type == "org.matrix.msc3531.visibility";
     }
 
     /**
