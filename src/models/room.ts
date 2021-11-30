@@ -154,18 +154,19 @@ export class Room extends EventEmitter {
 
     /**
      * A mapping of eventId to all visibility changes to apply
-     * to the event, by chronological order.
+     * to the event, by chronological order, as per
+     * https://github.com/matrix-org/matrix-doc/pull/3531
      *
      * # Invariants
      *
      * - within each list, all value events are classed by
      *   chronological order;
      * - all value events are events such that
-     *  `isVisibilityChange()` returns `true`.
+     *  `isEventVisibilityChange()` returns `true`;
+     * - all varlue events are event such that
+     *   `getEventVisibilityChange()` is either `"visible"` or `"hidden"`;
      * - within each list with key `eventId`, all value events
      *   are in relation to `eventId`.
-     * - all value events are *valid* visibility changes,
-     *   insofar as visibility is either `"visible"` or `"hidden"`.
      *
      * @experimental
      */
@@ -1389,13 +1390,13 @@ export class Room extends EventEmitter {
 
             // If this event is a visibility change event, remove it from the
             // list of visibility changes and update any event affected by it.
-            if (redactedEvent.isVisibilityChange()) {
+            if (redactedEvent.isEventVisibilityChange()) {
                 this.redactVisibilityChangeEvent(event);
             }
         }
 
         // Implement MSC3531: hiding messages.
-        if (event.isVisibilityChange()) {
+        if (event.isEventVisibilityChange()) {
             // This event changes the visibility of another event, record
             // the visibility change, inform clients if necessary.
             this.applyNewVisibilityChangeEvent(event);
@@ -2298,7 +2299,7 @@ export class Room extends EventEmitter {
      */
     private applyNewVisibilityChangeEvent(event: MatrixEvent): void {
         // Perform sanity checks on the event.
-        if (!event.isVisibilityChange()) {
+        if (!event.isEventVisibilityChange()) {
             // Internal error.
             throw new Error("Expected a visibility change relation");
         }
@@ -2306,7 +2307,7 @@ export class Room extends EventEmitter {
         const relation = event.getRelation();
         const originalEventId = relation.event_id;
         let visible: boolean;
-        switch (relation["visibility"]) {
+        switch (event.getEventVisibilityChange()) {
             case "hidden":
                 visible = false;
                 break;
@@ -2372,7 +2373,7 @@ export class Room extends EventEmitter {
 
     private redactVisibilityChangeEvent(event: MatrixEvent) {
         // Sanity checks.
-        if (!event.isVisibilityChange) {
+        if (!event.isEventVisibilityChange) {
             throw new Error("expected a visibility change event");
         }
         const relation = event.getRelation();

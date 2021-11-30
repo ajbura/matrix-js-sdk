@@ -28,6 +28,9 @@ import {
     EventType,
     MsgType,
     RelationType,
+    UNSTABLE_MSC3531_REASON_FIELD,
+    UNSTABLE_MSC3531_VISIBILITY_CHANGE_FIELD,
+    UNSTABLE_MSC3531_VISIBILITY_CHANGE_REL_TYPE,
 } from "../@types/event";
 import { Crypto } from "../crypto";
 import { deepSortedObjectEntries } from "../utils";
@@ -170,7 +173,7 @@ export class MatrixEvent extends EventEmitter {
     private _isCancelled = false;
     private clearEvent?: IClearEvent;
 
-    /* Message hiding, as specified by MSC3515.
+    /* Message hiding, as specified by https://github.com/matrix-org/matrix-doc/pull/3531.
      *
      * If `null`/`undefined`, the message should be displayed as usual.
      *
@@ -954,14 +957,14 @@ export class MatrixEvent extends EventEmitter {
     }
 
     /**
-     * Apply a MSC3531 event to hide/unhide the message.
+     * Change the visibility of an event, as per https://github.com/matrix-org/matrix-doc/pull/3531 .
      *
      * @param visible If true, mark the message as visible, otherwise mark the message as hidden.
      * @param reason If specified, a reason for hiding the message. Ignored if `visible` is `true`.
      * @return true if the event caused a change, false if it should be ignored.
      */
     public applyVisibilityChange(visible: boolean, reason?: string): boolean {
-        let change;
+        let change: boolean;
         if (visible) {
             change = this.messageHiding != null;
             this.messageHiding = null;
@@ -1046,18 +1049,77 @@ export class MatrixEvent extends EventEmitter {
     }
 
     /**
-     * Check if this event alters the visibility of another event.
+     * Check if this event alters the visibility of another event,
+     * as per https://github.com/matrix-org/matrix-doc/pull/3531.
      *
      * @returns {boolean} True if this event alters the visibility
      * of another event.
      */
-    public isVisibilityChange(): boolean {
+    public isEventVisibilityChange(): boolean {
         const relation = this.getRelation();
         if (!relation) {
             return false;
         }
-        return relation.rel_type == "m.visibility"
-            || relation.rel_type == "org.matrix.msc3531.visibility";
+        return UNSTABLE_MSC3531_VISIBILITY_CHANGE_REL_TYPE.matches(relation.rel_type);
+    }
+
+    /**
+     * Return the visibility change caused by this event,
+     * as per https://github.com/matrix-org/matrix-doc/pull/3531.
+     *
+     * @returns "visible" if the event is a well-formed visibility change
+     * event specifying that the original message should now be visible,
+     * "hidden" if the event is a well-formed visibility change specifying
+     * that the original message should now be hidden or null otherwise.
+     */
+    public getEventVisibilityChange(): "visible" | "hidden" | null {
+        const relation = this.getRelation();
+        if (!relation) {
+            return null;
+        }
+        if (!UNSTABLE_MSC3531_VISIBILITY_CHANGE_REL_TYPE.matches(relation.rel_type)) {
+            return null;
+        }
+        for (const key of [
+            UNSTABLE_MSC3531_VISIBILITY_CHANGE_FIELD.stable,
+            UNSTABLE_MSC3531_VISIBILITY_CHANGE_FIELD.unstable]) {
+            if (!key) {
+                continue;
+            }
+            switch ((relation as any)[key]) {
+                case "visible":
+                    return "visible";
+                case "hidden":
+                    return "hidden";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Return the optional reason for a visibility change event,
+     * as per https://github.com/matrix-org/matrix-doc/pull/3531.
+     *
+     * @returns a reason if the event is a valid visibility change
+     * event and a reason was specified.
+     */
+    public getEventVisibilityReason(): string | null {
+        if (!this.isEventVisibilityChange()) {
+            return null;
+        }
+        const content = this.getContent();
+        for (const key of [
+            UNSTABLE_MSC3531_REASON_FIELD.stable,
+            UNSTABLE_MSC3531_REASON_FIELD.unstable]) {
+            if (!key) {
+                continue;
+            }
+            const reason = content[key];
+            if (!reason && typeof reason == "string") {
+                return reason;
+            }
+        }
+        return null;
     }
 
     /**
