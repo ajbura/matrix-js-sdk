@@ -36,6 +36,7 @@ import { GuestAccess, HistoryVisibility, JoinRule, ResizeMethod } from "../@type
 import { Filter } from "../filter";
 import { RoomState } from "./room-state";
 import { Thread, ThreadEvent } from "./thread";
+import { IVisibilityChangeRelation } from "..";
 
 // These constants are used as sane defaults when the homeserver doesn't support
 // the m.room_versions capability. In practice, KNOWN_SAFE_ROOM_VERSION should be
@@ -104,23 +105,6 @@ interface IReceiptContent {
 
 type Receipts = Record<string, Record<string, IWrappedReceipt>>;
 
-/**
- * A change to the visibility of a message.
- */
-type VisibilityChange = {
-    // `true` if the message should be visible from now on, `false`
-    // if it should be hidden from now on.
-    visible: boolean,
-
-    // The timestamp for this change. A more recent visibility change
-    // overwrites an older one.
-    originServerTs: number,
-
-    // Optionally, a reason for hiding the message, e.g. "moderation pending".
-    // Ignored if `this.visible == true`
-    reason?: string
-};
-
 export enum NotificationCountType {
     Highlight = "highlight",
     Total = "total",
@@ -169,12 +153,23 @@ export class Room extends EventEmitter {
     public threads = new Map<string, Thread>();
 
     /**
-     * A mapping of eventId to the latest visibility change to apply
-     * to the event.
+     * A mapping of eventId to all visibility changes to apply
+     * to the event, by chronological order.
+     *
+     * # Invariants
+     *
+     * - within each list, all value events are classed by
+     *   chronological order;
+     * - all value events are events such that
+     *  `isVisibilityChange()` returns `true`.
+     * - within each list with key `eventId`, all value events
+     *   are in relation to `eventId`.
+     * - all value events are *valid* visibility changes,
+     *   insofar as visibility is either `"visible"` or `"hidden"`.
      *
      * @experimental
      */
-    private visibilityChanges = new Map<string, VisibilityChange>();
+    private visibilityChanges = new Map<string, MatrixEvent[]>();
 
     /**
      * Construct a new Room.
@@ -1388,6 +1383,15 @@ export class Room extends EventEmitter {
             // NB: We continue to add the redaction event to the timeline so
             // clients can say "so and so redacted an event" if they wish to. Also
             // this may be needed to trigger an update.
+
+            // Remove any visibility change on this event.
+            this.visibilityChanges.delete(redactId);
+
+            // If this event is a visibility change event, remove it from the
+            // list of visibility changes and update any event affected by it.
+            if (redactedEvent.isVisibilityChange()) {
+                this.redactVisibilityChangeEvent(event);
+            }
         }
 
         // Implement MSC3531: hiding messages.
@@ -2330,21 +2334,28 @@ export class Room extends EventEmitter {
         // If the event is not in our timeline and we only receive it later,
         // we may need to apply the visibility change at a later date.
 
-        const visibilityChange = this.visibilityChanges.get(originalEventId);
-        if (visibilityChange) {
-            if (event.getTs() < visibilityChange.originServerTs) {
-                // This visibility change event has been superseeded by a new event,
-                // ignore it.
-                return;
+        const visibilityChangesOnOriginalEvent = this.visibilityChanges.get(originalEventId);
+        if (visibilityChangesOnOriginalEvent) {
+            // It would be tempting to simply erase the latest visibility change
+            // but we need to record all of the changes in case the latest change
+            // is ever redacted.
+            // In practice, it should be unusual for an event to have more than
+            // 2 visibility changes, so linear scans through `visibilityChanges`
+            // should be fast. It might be possible to DoS this feature, though.
+            let index = visibilityChangesOnOriginalEvent.length - 1;
+            for (; index >= 0; --index) {
+                const target = visibilityChangesOnOriginalEvent[index];
+                if (target.getTs() < event.getTs()) {
+                    break;
+                }
             }
-            visibilityChange.originServerTs = event.getTs();
-            visibilityChange.visible = visible;
+            if (index == -1) {
+                visibilityChangesOnOriginalEvent.unshift(event);
+            } else {
+                visibilityChangesOnOriginalEvent.splice(index + 1, 0, event);
+            }
         } else {
-            this.visibilityChanges.set(originalEventId, {
-                originServerTs: event.getTs(),
-                visible,
-                reason,
-            });
+            this.visibilityChanges.set(originalEventId, [event]);
         }
 
         // Finally, let's check if the event is already in our timeline.
@@ -2359,6 +2370,70 @@ export class Room extends EventEmitter {
         }
     }
 
+    private redactVisibilityChangeEvent(event: MatrixEvent) {
+        // Sanity checks.
+        if (!event.isVisibilityChange) {
+            throw new Error("expected a visibility change event");
+        }
+        const relation = event.getRelation();
+        const originalEventId = relation.event_id;
+        const visibilityChangesOnOriginalEvent = this.visibilityChanges.get(originalEventId);
+        if (!visibilityChangesOnOriginalEvent) {
+            // No visibility changes on the original event.
+            // In particular, this change event was not recorded,
+            // most likely because it was ill-formed.
+            return;
+        }
+        const index = visibilityChangesOnOriginalEvent.findIndex(change => change.getId() == event.getId());
+        if (index == -1) {
+            // This change event was not recorded, most likely because
+            // it was ill-formed.
+            return;
+        }
+        // Remove visibility change.
+        visibilityChangesOnOriginalEvent.splice(index, 1);
+
+        // If we removed the latest visibility change event, propagate changes.
+        if (index == visibilityChangesOnOriginalEvent.length) {
+            const originalEvent = this.findEventById(originalEventId);
+            if (!originalEvent) {
+                return;
+            }
+            if (index == 0) {
+                // We have just removed the only visibility change event.
+                this.visibilityChanges.delete(originalEventId);
+                if (originalEvent.applyVisibilityChange(true)) {
+                    // FIXME: We have no event to send!
+                }
+            } else {
+                const newEvent = visibilityChangesOnOriginalEvent[visibilityChangesOnOriginalEvent.length - 1];
+                const newrelation = newEvent.getRelation();
+                let visible: boolean;
+                switch (newrelation["visibility"]) {
+                    case "hidden":
+                        visible = false;
+                        break;
+                    case "visible":
+                        visible = true;
+                        break;
+                    default:
+                        // Event is ill-formed.
+                        // This breaks our invariant.
+                        throw new Error("at this stage, visibility changes should be well-formed");
+                }
+                const reason = visible ? newEvent.getContent()["reason"] : null;
+                if (reason != null && reason !== undefined && typeof reason != "string") {
+                    // Event is ill-formed.
+                    // This breaks our invariant.
+                    throw new Error("at this stage, visibility changes should be well-formed");
+                }
+                if (originalEvent.applyVisibilityChange(visible, reason)) {
+                    this.emit("Room.visibilityChange", newEvent);
+                }
+            }
+        }
+    }
+
     /**
      * When we receive an event whose visibility has been altered by
      * a (more recent) visibility change event, patch the event in
@@ -2369,24 +2444,26 @@ export class Room extends EventEmitter {
      * change event.
      */
     private applyPendingVisibilityChanges(event: MatrixEvent): void {
-        const visibilityChange = this.visibilityChanges.get(event.getId());
-        if (!visibilityChange) {
+        const visibilityChanges = this.visibilityChanges.get(event.getId());
+        if (!visibilityChanges || visibilityChanges.length == 0) {
             // No pending visibility change in store.
             return;
         }
-        if (visibilityChange.visible) {
+        const visibilityChange = visibilityChanges[visibilityChanges.length - 1];
+        const relation = visibilityChange.getRelation() as IVisibilityChangeRelation;
+        if (relation.visibility == "visible") {
             // Events are visible by default, no need to apply a visibility change.
             // Note that we need to keep the visibility changes in `visibilityChanges`,
             // in case we later fetch an older visibility change event that is superseded
             // by `visibilityChange`.
             return;
         }
-        if (visibilityChange.originServerTs < event.getTs()) {
+        if (visibilityChange.getTs() < event.getTs()) {
             // Something is wrong, the visibility change cannot happen before the
             // event. Presumably an ill-formed event.
             return;
         }
-        event.applyVisibilityChange(false, visibilityChange.reason);
+        event.applyVisibilityChange(false, relation.reason);
     }
 }
 

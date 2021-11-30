@@ -124,6 +124,11 @@ export interface IEventRelation {
     key?: string;
 }
 
+export interface IVisibilityChangeRelation extends IEventRelation {
+    visibility: "visible" | "hidden";
+    reason?: string;
+}
+
 interface IDecryptionResult {
     clearEvent: {
         room_id?: string;
@@ -951,7 +956,8 @@ export class MatrixEvent extends EventEmitter {
     /**
      * Apply a MSC3531 event to hide/unhide the message.
      *
-     * @param visibilityEvent event causing the hide/unhide change.
+     * @param visible If true, mark the message as visible, otherwise mark the message as hidden.
+     * @param reason If specified, a reason for hiding the message. Ignored if `visible` is `true`.
      * @return true if the event caused a change, false if it should be ignored.
      */
     public applyVisibilityChange(visible: boolean, reason?: string): boolean {
