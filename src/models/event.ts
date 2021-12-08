@@ -181,7 +181,7 @@ export class MatrixEvent extends EventEmitter {
      * contain a reason to be displayed to users (e.g. "message pending
      * moderation").
      */
-    private messageHiding?: IMessageHiding;
+    public messageHiding?: IMessageHiding;
 
     /* curve25519 key which we believe belongs to the sender of the event. See
      * getSenderKey()
@@ -977,6 +977,23 @@ export class MatrixEvent extends EventEmitter {
             }
         }
         return change;
+    }
+
+    /**
+     * Return instructions to display or hide the message.
+     *
+     * @returns An object `{visible, reason}` determining whether the message
+     * should be displayed. If `visible` is `true`, the message should be
+     * displayed as usual and `reason` should be ignored. Otherwise, the
+     * message should be hidden and `reason` _may_ contain a user-readable
+     * reason provided by a moderator.
+     */
+    public messageVisibility(): { visible: boolean, reason?: string } {
+        if (this.messageHiding) {
+            return { visible: false, reason: this.messageHiding.reason };
+        } else {
+            return { visible: true };
+        }
     }
 
     /**
