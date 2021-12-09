@@ -2413,7 +2413,7 @@ export class Room extends EventEmitter {
                 // We have just removed the only visibility change event.
                 this.visibilityEvents.delete(originalEventId);
                 if (originalEvent.applyVisibilityEvent(true)) {
-                    // FIXME: We have no event to send!
+                    this.emit("Room.visibilityChange", null);
                 }
             } else {
                 const newEvent = visibilityEventsOnOriginalEvent[visibilityEventsOnOriginalEvent.length - 1];
