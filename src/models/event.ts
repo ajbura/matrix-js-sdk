@@ -28,9 +28,9 @@ import {
     EventType,
     MsgType,
     RelationType,
-    UNSTABLE_MSC3531_REASON_FIELD,
-    UNSTABLE_MSC3531_VISIBILITY_CHANGE_FIELD,
-    UNSTABLE_MSC3531_VISIBILITY_CHANGE_REL_TYPE,
+    MSC3531_REASON_FIELD,
+    MSC3531_VISIBILITY_CHANGE_FIELD,
+    MSC3531_VISIBILITY_CHANGE_REL_TYPE,
 } from "../@types/event";
 import { Crypto } from "../crypto";
 import { deepSortedObjectEntries } from "../utils";
@@ -127,7 +127,7 @@ export interface IEventRelation {
     key?: string;
 }
 
-export interface IVisibilityChangeRelation extends IEventRelation {
+export interface IVisibilityEventRelation extends IEventRelation {
     visibility: "visible" | "hidden";
     reason?: string;
 }
@@ -162,9 +162,29 @@ export interface IDecryptOptions {
     isRetry?: boolean;
 }
 
-export interface IMessageHiding {
-    reason?: string;
+/**
+ * Message hiding, as specified by https://github.com/matrix-org/matrix-doc/pull/3531.
+ */
+export type MessageVisibility = IMessageVisibilityHidden | IMessageVisibilityVisible;
+/**
+ * Variant of `MessageVisibility` for the case in which the message should be displayed.
+ */
+export interface IMessageVisibilityVisible {
+    readonly visible: true;
 }
+/**
+ * Variant of `MessageVisibility` for the case in which the message should be hidden.
+ */
+export interface IMessageVisibilityHidden {
+    readonly visible: false;
+    /**
+     * Optionally, a human-readable reason to show to the user indicating why the
+     * message has been hidden (e.g. "Message Pending Moderation").
+     */
+    readonly reason: string | null;
+}
+// A singleton implementing `IMessageVisibilityVisible`.
+const MESSAGE_VISIBLE: IMessageVisibilityVisible = Object.freeze({ visible: true });
 
 export class MatrixEvent extends EventEmitter {
     private pushActions: IActionsObject = null;
@@ -174,14 +194,10 @@ export class MatrixEvent extends EventEmitter {
     private clearEvent?: IClearEvent;
 
     /* Message hiding, as specified by https://github.com/matrix-org/matrix-doc/pull/3531.
-     *
-     * If `null`/`undefined`, the message should be displayed as usual.
-     *
-     * Otherwise, the client should hide this message and this field may
-     * contain a reason to be displayed to users (e.g. "message pending
-     * moderation").
-     */
-    public messageHiding?: IMessageHiding;
+
+    Note: We're returning this object, so any value stored here MUST be frozen.
+    */
+    private visibility: MessageVisibility = MESSAGE_VISIBLE;
 
     /* curve25519 key which we believe belongs to the sender of the event. See
      * getSenderKey()
@@ -963,18 +979,24 @@ export class MatrixEvent extends EventEmitter {
      * @param reason If specified, a reason for hiding the message. Ignored if `visible` is `true`.
      * @return true if the event caused a change, false if it should be ignored.
      */
-    public applyVisibilityChange(visible: boolean, reason?: string): boolean {
+    public applyVisibilityEvent(visible: boolean, reason?: string): boolean {
         let change: boolean;
-        if (visible) {
-            change = this.messageHiding != null;
-            this.messageHiding = null;
-        } else {
-            change = this.messageHiding == null || this.messageHiding.reason != reason;
-            if (change) {
-                this.messageHiding = {
-                    reason,
-                };
-            }
+        switch (this.visibility.visible) {
+            case true:
+                change = !visible;
+                this.visibility = MESSAGE_VISIBLE;
+                break;
+            case false:
+                if (visible || this.visibility.reason != reason) {
+                    change = true;
+                    this.visibility = Object.freeze({
+                        visible: false,
+                        reason: reason || null,
+                    });
+                } else {
+                    change = false;
+                }
+                break;
         }
         return change;
     }
@@ -988,12 +1010,9 @@ export class MatrixEvent extends EventEmitter {
      * message should be hidden and `reason` _may_ contain a user-readable
      * reason provided by a moderator.
      */
-    public messageVisibility(): { visible: boolean, reason?: string } {
-        if (this.messageHiding) {
-            return { visible: false, reason: this.messageHiding.reason };
-        } else {
-            return { visible: true };
-        }
+    public messageVisibility(): MessageVisibility {
+        // Note: We may return `this.visibility` as it has been frozen.
+        return this.visibility;
     }
 
     /**
@@ -1072,12 +1091,12 @@ export class MatrixEvent extends EventEmitter {
      * @returns {boolean} True if this event alters the visibility
      * of another event.
      */
-    public isEventVisibilityChange(): boolean {
+    public isVisibilityEvent(): boolean {
         const relation = this.getRelation();
         if (!relation) {
             return false;
         }
-        return UNSTABLE_MSC3531_VISIBILITY_CHANGE_REL_TYPE.matches(relation.rel_type);
+        return MSC3531_VISIBILITY_CHANGE_REL_TYPE.matches(relation.rel_type);
     }
 
     /**
@@ -1089,28 +1108,23 @@ export class MatrixEvent extends EventEmitter {
      * "hidden" if the event is a well-formed visibility change specifying
      * that the original message should now be hidden or null otherwise.
      */
-    public getEventVisibilityChange(): "visible" | "hidden" | null {
+    public getVisibilityEventChange(): "visible" | "hidden" | null {
         const relation = this.getRelation();
         if (!relation) {
             return null;
         }
-        if (!UNSTABLE_MSC3531_VISIBILITY_CHANGE_REL_TYPE.matches(relation.rel_type)) {
+        if (!MSC3531_VISIBILITY_CHANGE_REL_TYPE.matches(relation.rel_type)) {
             return null;
         }
-        for (const key of [
-            UNSTABLE_MSC3531_VISIBILITY_CHANGE_FIELD.stable,
-            UNSTABLE_MSC3531_VISIBILITY_CHANGE_FIELD.unstable]) {
-            if (!key) {
-                continue;
-            }
-            switch ((relation as any)[key]) {
-                case "visible":
-                    return "visible";
-                case "hidden":
-                    return "hidden";
-            }
+        switch (MSC3531_VISIBILITY_CHANGE_FIELD.findIn(relation)) {
+            case "visible":
+                return "visible";
+            case "hidden":
+                return "hidden";
+            default:
+                // Event is ill-formed.
+                return null;
         }
-        return null;
     }
 
     /**
@@ -1120,14 +1134,14 @@ export class MatrixEvent extends EventEmitter {
      * @returns a reason if the event is a valid visibility change
      * event and a reason was specified.
      */
-    public getEventVisibilityReason(): string | null {
-        if (!this.isEventVisibilityChange()) {
+    public getVisibilityEventReason(): string | null {
+        if (!this.isVisibilityEvent()) {
             return null;
         }
         const content = this.getContent();
         for (const key of [
-            UNSTABLE_MSC3531_REASON_FIELD.stable,
-            UNSTABLE_MSC3531_REASON_FIELD.unstable]) {
+            MSC3531_REASON_FIELD.stable,
+            MSC3531_REASON_FIELD.unstable]) {
             if (!key) {
                 continue;
             }
